@@ -19,15 +19,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/improbable-eng/thanos/pkg/extprom"
-
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/improbable-eng/thanos/pkg/alert"
-	"github.com/improbable-eng/thanos/pkg/block"
+	"github.com/improbable-eng/thanos/pkg/block/blockmeta"
 	"github.com/improbable-eng/thanos/pkg/cluster"
 	"github.com/improbable-eng/thanos/pkg/discovery/cache"
 	"github.com/improbable-eng/thanos/pkg/discovery/dns"
+	"github.com/improbable-eng/thanos/pkg/extprom"
 	"github.com/improbable-eng/thanos/pkg/objstore/client"
 	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/improbable-eng/thanos/pkg/shipper"
@@ -290,7 +289,7 @@ func runRule(
 		ctx, cancel := context.WithCancel(context.Background())
 		ctx = tracing.ContextWithTracer(ctx, tracer)
 
-		notify := func(ctx context.Context, expr string, alerts ...*rules.Alert) error {
+		notify := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
 			res := make([]*alert.Alert, 0, len(alerts))
 			for _, alrt := range alerts {
 				// Only send actually firing alerts.
@@ -309,8 +308,6 @@ func runRule(
 				res = append(res, a)
 			}
 			alertQ.Push(res)
-
-			return nil
 		}
 		mgr = rules.NewManager(&rules.ManagerOptions{
 			Context:     ctx,
@@ -579,7 +576,7 @@ func runRule(
 			}
 		}()
 
-		s := shipper.New(logger, nil, dataDir, bkt, func() labels.Labels { return lset }, block.RulerSource)
+		s := shipper.New(logger, nil, dataDir, bkt, func() labels.Labels { return lset }, blockmeta.RulerSource)
 
 		ctx, cancel := context.WithCancel(context.Background())
 

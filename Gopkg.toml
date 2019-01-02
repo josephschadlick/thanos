@@ -37,7 +37,8 @@ ignored = ["github.com/improbable-eng/thanos/benchmark/*"]
   name = "github.com/prometheus/common"
 
 [[constraint]]
-  version = "v2.3.2"
+  # TODO(bwplotka): Move to released version once our recent fixes will be merged & released.
+  revision = "6e08029b56ae17c49e133d92a2792f6f119f2cbd"
   name = "github.com/prometheus/prometheus"
 
 [[override]]
@@ -46,7 +47,9 @@ ignored = ["github.com/improbable-eng/thanos/benchmark/*"]
 
 [[constraint]]
   name = "github.com/prometheus/tsdb"
-  revision = "bd832fc8274e8fe63999ac749daaaff9d881241f"
+  # TODO(bwplotka): Move to upstream version once https://github.com/prometheus/tsdb/pull/492 is merged.
+  revision = "fd04e0963c04a1fbd891be7552b50f58e357f75c"
+  source = "github.com/bwplotka/tsdb"
 
 [[constraint]]
   branch = "master"

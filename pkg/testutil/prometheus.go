@@ -12,8 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/improbable-eng/thanos/pkg/block/blockmeta"
+
 	"github.com/go-kit/kit/log"
-	"github.com/improbable-eng/thanos/pkg/block"
 	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
@@ -188,7 +189,7 @@ func CreateBlock(
 	extLset labels.Labels,
 	resolution int64,
 ) (id ulid.ULID, err error) {
-	h, err := tsdb.NewHead(nil, nil, tsdb.NopWAL(), 10000000000)
+	h, err := tsdb.NewHead(nil, nil, nil, 10000000000)
 	if err != nil {
 		return id, errors.Wrap(err, "create head block")
 	}
@@ -238,15 +239,15 @@ func CreateBlock(
 		return id, errors.Wrap(err, "create compactor")
 	}
 
-	id, err = c.Write(dir, h, mint, maxt)
+	id, err = c.Write(dir, h, mint, maxt, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "write block")
 	}
 
-	if _, err = block.InjectThanosMeta(log.NewNopLogger(), filepath.Join(dir, id.String()), block.ThanosMeta{
+	if _, err = blockmeta.InjectThanos(log.NewNopLogger(), filepath.Join(dir, id.String()), blockmeta.Thanos{
 		Labels:     extLset.Map(),
-		Downsample: block.ThanosDownsampleMeta{Resolution: resolution},
-		Source:     block.TestSource,
+		Downsample: blockmeta.ThanosDownsample{Resolution: resolution},
+		Source:     blockmeta.TestSource,
 	}, nil); err != nil {
 		return id, errors.Wrap(err, "finalize block")
 	}

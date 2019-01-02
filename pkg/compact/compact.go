@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/improbable-eng/thanos/pkg/block/blockmeta"
+
 	"io/ioutil"
 
 	"github.com/go-kit/kit/log"
@@ -39,7 +41,7 @@ type Syncer struct {
 	bkt       objstore.Bucket
 	syncDelay time.Duration
 	mtx       sync.Mutex
-	blocks    map[ulid.ULID]*block.Meta
+	blocks    map[ulid.ULID]*blockmeta.Meta
 	metrics   *syncerMetrics
 }
 
@@ -130,7 +132,7 @@ func NewSyncer(logger log.Logger, reg prometheus.Registerer, bkt objstore.Bucket
 		logger:    logger,
 		reg:       reg,
 		syncDelay: syncDelay,
-		blocks:    map[ulid.ULID]*block.Meta{},
+		blocks:    map[ulid.ULID]*blockmeta.Meta{},
 		bkt:       bkt,
 		metrics:   newSyncerMetrics(reg),
 	}, nil
@@ -185,9 +187,9 @@ func (c *Syncer) syncMetas(ctx context.Context) error {
 		// NOTE: It is not safe to miss "old" block (even that it is newly created) in sync step. Compactor needs to aware of ALL old blocks.
 		// TODO(bplotka): https://github.com/improbable-eng/thanos/issues/377
 		if ulid.Now()-id.Time() < uint64(c.syncDelay/time.Millisecond) &&
-			meta.Thanos.Source != block.BucketRepairSource &&
-			meta.Thanos.Source != block.CompactorSource &&
-			meta.Thanos.Source != block.CompactorRepairSource {
+			meta.Thanos.Source != blockmeta.BucketRepairSource &&
+			meta.Thanos.Source != blockmeta.CompactorSource &&
+			meta.Thanos.Source != blockmeta.CompactorRepairSource {
 
 			level.Debug(c.logger).Log("msg", "block is too fresh for now", "block", id)
 			return nil
@@ -214,7 +216,7 @@ func (c *Syncer) syncMetas(ctx context.Context) error {
 
 // GroupKey returns a unique identifier for the group the block belongs to. It considers
 // the downsampling resolution and the block's labels.
-func GroupKey(meta block.Meta) string {
+func GroupKey(meta blockmeta.Meta) string {
 	return groupKey(meta.Thanos.Downsample.Resolution, labels.FromMap(meta.Thanos.Labels))
 }
 
@@ -381,7 +383,7 @@ type Group struct {
 	labels                      labels.Labels
 	resolution                  int64
 	mtx                         sync.Mutex
-	blocks                      map[ulid.ULID]*block.Meta
+	blocks                      map[ulid.ULID]*blockmeta.Meta
 	compactions                 prometheus.Counter
 	compactionFailures          prometheus.Counter
 	groupGarbageCollectedBlocks prometheus.Counter
@@ -405,7 +407,7 @@ func newGroup(
 		bkt:                         bkt,
 		labels:                      lset,
 		resolution:                  resolution,
-		blocks:                      map[ulid.ULID]*block.Meta{},
+		blocks:                      map[ulid.ULID]*blockmeta.Meta{},
 		compactions:                 compactions,
 		compactionFailures:          compactionFailures,
 		groupGarbageCollectedBlocks: groupGarbageCollectedBlocks,
@@ -419,7 +421,7 @@ func (cg *Group) Key() string {
 }
 
 // Add the block with the given meta to the group.
-func (cg *Group) Add(meta *block.Meta) error {
+func (cg *Group) Add(meta *blockmeta.Meta) error {
 	cg.mtx.Lock()
 	defer cg.mtx.Unlock()
 
@@ -541,7 +543,7 @@ func IsRetryError(err error) bool {
 	return ok
 }
 
-func (cg *Group) areBlocksOverlapping(include *block.Meta, excludeDirs ...string) error {
+func (cg *Group) areBlocksOverlapping(include *blockmeta.Meta, excludeDirs ...string) error {
 	var (
 		metas   []tsdb.BlockMeta
 		exclude = map[ulid.ULID]struct{}{}
@@ -597,12 +599,12 @@ func RepairIssue347(ctx context.Context, logger log.Logger, bkt objstore.Bucket,
 		return retry(errors.Wrapf(err, "download block %s", ie.id))
 	}
 
-	meta, err := block.ReadMetaFile(bdir)
+	meta, err := blockmeta.Read(bdir)
 	if err != nil {
 		return errors.Wrapf(err, "read meta from %s", bdir)
 	}
 
-	resid, err := block.Repair(logger, tmpdir, ie.id, block.CompactorRepairSource, block.IgnoreIssue347OutsideChunk)
+	resid, err := block.Repair(logger, tmpdir, ie.id, blockmeta.CompactorRepairSource, block.IgnoreIssue347OutsideChunk)
 	if err != nil {
 		return errors.Wrapf(err, "repair failed for block %s", ie.id)
 	}
@@ -647,7 +649,7 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 		if err := os.MkdirAll(bdir, 0777); err != nil {
 			return compID, errors.Wrap(err, "create planning block dir")
 		}
-		if err := block.WriteMetaFile(cg.logger, bdir, meta); err != nil {
+		if err := blockmeta.Write(cg.logger, bdir, meta); err != nil {
 			return compID, errors.Wrap(err, "write planning meta file")
 		}
 	}
@@ -670,7 +672,7 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 	begin := time.Now()
 
 	for _, pdir := range plan {
-		meta, err := block.ReadMetaFile(pdir)
+		meta, err := blockmeta.Read(pdir)
 		if err != nil {
 			return compID, errors.Wrapf(err, "read meta from %s", pdir)
 		}
@@ -718,7 +720,7 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 
 	begin = time.Now()
 
-	compID, err = comp.Compact(dir, plan...)
+	compID, err = comp.Compact(dir, plan, nil)
 	if err != nil {
 		return compID, halt(errors.Wrapf(err, "compact blocks %v", plan))
 	}
@@ -727,10 +729,10 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 
 	bdir := filepath.Join(dir, compID.String())
 
-	newMeta, err := block.InjectThanosMeta(cg.logger, bdir, block.ThanosMeta{
+	newMeta, err := blockmeta.InjectThanos(cg.logger, bdir, blockmeta.Thanos{
 		Labels:     cg.labels.Map(),
-		Downsample: block.ThanosDownsampleMeta{Resolution: cg.resolution},
-		Source:     block.CompactorSource,
+		Downsample: blockmeta.ThanosDownsample{Resolution: cg.resolution},
+		Source:     blockmeta.CompactorSource,
 	}, nil)
 	if err != nil {
 		return compID, errors.Wrapf(err, "failed to finalize the block %s", bdir)

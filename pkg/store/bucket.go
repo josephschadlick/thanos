@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/improbable-eng/thanos/pkg/block/blockmeta"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/improbable-eng/thanos/pkg/block"
@@ -459,6 +461,7 @@ func (s *bucketSeriesSet) Err() error {
 	return s.err
 }
 
+// blockSeries return requested series from given index and chunk readers.
 func (s *BucketStore) blockSeries(
 	ctx context.Context,
 	ulid ulid.ULID,
@@ -488,7 +491,6 @@ func (s *BucketStore) blockSeries(
 	}
 
 	// Get result postings list by resolving the postings tree.
-	// TODO(bwplotka): Users are seeing panics here, because of lazyPosting being not loaded by preloadPostings.
 	ps, err := index.ExpandPostings(lazyPostings)
 	if err != nil {
 		return nil, stats, errors.Wrap(err, "expand postings")
@@ -504,7 +506,8 @@ func (s *BucketStore) blockSeries(
 		}
 	}
 
-	// Preload all series index data
+	// Preload all series index data.
+	// TODO(bwplotka): Consider not keeping all series in memory all the time.
 	if err := indexr.preloadSeries(ps); err != nil {
 		return nil, stats, errors.Wrap(err, "preload series")
 	}
@@ -1001,7 +1004,7 @@ func (s *bucketBlockSet) labelMatchers(matchers ...labels.Matcher) ([]labels.Mat
 type bucketBlock struct {
 	logger     log.Logger
 	bucket     objstore.BucketReader
-	meta       *block.Meta
+	meta       *blockmeta.Meta
 	dir        string
 	indexCache *indexCache
 	chunkPool  *pool.BytesPool
@@ -1065,7 +1068,7 @@ func (b *bucketBlock) loadMeta(ctx context.Context, id ulid.ULID) error {
 	} else if err != nil {
 		return err
 	}
-	meta, err := block.ReadMetaFile(b.dir)
+	meta, err := blockmeta.Read(b.dir)
 	if err != nil {
 		return errors.Wrap(err, "read meta.json")
 	}
@@ -1095,19 +1098,15 @@ func (b *bucketBlock) loadIndexCache(ctx context.Context) (err error) {
 		}
 	}()
 
-	indexr, err := index.NewFileReader(fn)
-	if err != nil {
-		return errors.Wrap(err, "open index reader")
-	}
-	defer runutil.CloseWithLogOnErr(b.logger, indexr, "load index cache reader")
+	// Create index cache adhoc.
 
-	if err := block.WriteIndexCache(b.logger, cachefn, indexr); err != nil {
+	if err := block.WriteIndexCache(b.logger, fn, cachefn); err != nil {
 		return errors.Wrap(err, "write index cache")
 	}
 
 	b.indexVersion, b.symbols, b.lvals, b.postings, err = block.ReadIndexCache(b.logger, cachefn)
 	if err != nil {
-		return errors.Wrap(err, "read index cache")
+		return errors.Wrap(err, "read fresh index cache")
 	}
 	return nil
 }
@@ -1179,13 +1178,20 @@ func newBucketIndexReader(ctx context.Context, logger log.Logger, block *bucketB
 		logger:       logger,
 		ctx:          ctx,
 		block:        block,
-		dec:          &index.Decoder{},
 		stats:        &queryStats{},
 		cache:        cache,
 		loadedSeries: map[uint64][]byte{},
 	}
-	r.dec.SetSymbolTable(r.block.symbols)
+	r.dec = &index.Decoder{LookupSymbol: r.lookupSymbol}
 	return r
+}
+
+func (r *bucketIndexReader) lookupSymbol(o uint32) (string, error) {
+	s, ok := r.block.symbols[o]
+	if !ok {
+		return "", errors.Errorf("bucketIndexReader: unknown symbol offset %d", o)
+	}
+	return s, nil
 }
 
 func (r *bucketIndexReader) preloadPostings() error {
@@ -1270,23 +1276,24 @@ func (r *bucketIndexReader) loadPostings(ctx context.Context, postings []*lazyPo
 	return nil
 }
 
-func (r *bucketIndexReader) preloadSeries(ids []uint64) error {
+func (r *bucketIndexReader) preloadSeries(refs []uint64) error {
 	const maxSeriesSize = 64 * 1024
 	const maxGapSize = 512 * 1024
 
-	var newIDs []uint64
+	var newRefs []uint64
 
-	for _, id := range ids {
-		if b, ok := r.cache.series(r.block.meta.ULID, id); ok {
-			r.loadedSeries[id] = b
+	for _, ref := range refs {
+		if b, ok := r.cache.series(r.block.meta.ULID, ref); ok {
+			r.loadedSeries[ref] = b
 			continue
 		}
-		newIDs = append(newIDs, id)
+		newRefs = append(newRefs, ref)
 	}
-	ids = newIDs
+	refs = newRefs
 
-	parts := partitionRanges(len(ids), func(i int) (start, end uint64) {
-		return ids[i], ids[i] + maxSeriesSize
+	// Combine multiple close byte ranges to not be rate-limited from object storage.
+	parts := partitionRanges(len(refs), func(i int) (start, end uint64) {
+		return refs[i], refs[i] + maxSeriesSize
 	}, maxGapSize)
 	var g run.Group
 
@@ -1295,7 +1302,7 @@ func (r *bucketIndexReader) preloadSeries(ids []uint64) error {
 		i, j := p[0], p[1]
 
 		g.Add(func() error {
-			return r.loadSeries(ctx, ids[i:j], ids[i], ids[j-1]+maxSeriesSize)
+			return r.loadSeries(ctx, refs[i:j], refs[i], refs[j-1]+maxSeriesSize)
 		}, func(err error) {
 			if err != nil {
 				cancel()
@@ -1305,7 +1312,7 @@ func (r *bucketIndexReader) preloadSeries(ids []uint64) error {
 	return g.Run()
 }
 
-func (r *bucketIndexReader) loadSeries(ctx context.Context, ids []uint64, start, end uint64) error {
+func (r *bucketIndexReader) loadSeries(ctx context.Context, refs []uint64, start, end uint64) error {
 	begin := time.Now()
 
 	b, err := r.block.readIndexRange(ctx, int64(start), int64(end-start))
@@ -1317,12 +1324,12 @@ func (r *bucketIndexReader) loadSeries(ctx context.Context, ids []uint64, start,
 	defer r.mtx.Unlock()
 
 	r.stats.seriesFetchCount++
-	r.stats.seriesFetched += len(ids)
+	r.stats.seriesFetched += len(refs)
 	r.stats.seriesFetchDurationSum += time.Since(begin)
 	r.stats.seriesFetchedSizeSum += int(end - start)
 
-	for _, id := range ids {
-		c := b[id-start:]
+	for _, ref := range refs {
+		c := b[ref-start:]
 
 		l, n := binary.Uvarint(c)
 		if n < 1 {
@@ -1332,8 +1339,8 @@ func (r *bucketIndexReader) loadSeries(ctx context.Context, ids []uint64, start,
 			return errors.Errorf("invalid remaining size %d, expected %d", len(c), n+int(l))
 		}
 		c = c[n : n+int(l)]
-		r.loadedSeries[id] = c
-		r.cache.setSeries(r.block.meta.ULID, id, c)
+		r.loadedSeries[ref] = c
+		r.cache.setSeries(r.block.meta.ULID, ref, c)
 	}
 	return nil
 }
@@ -1421,6 +1428,7 @@ func (r *bucketIndexReader) SortedPostings(p index.Postings) index.Postings {
 // Series populates the given labels and chunk metas for the series identified
 // by the reference.
 // Returns ErrNotFound if the ref does not resolve to a known series.
+// prealoadSeries needs to be invoked first to have this method return loaded results.
 func (r *bucketIndexReader) Series(ref uint64, lset *labels.Labels, chks *[]chunks.Meta) error {
 	b, ok := r.loadedSeries[ref]
 	if !ok {
@@ -1435,6 +1443,11 @@ func (r *bucketIndexReader) Series(ref uint64, lset *labels.Labels, chks *[]chun
 
 // LabelIndices returns the label pairs for which indices exist.
 func (r *bucketIndexReader) LabelIndices() ([][]string, error) {
+	return nil, errors.New("not implemented")
+}
+
+// LabelNames returns all the unique label names present in the index in sorted order.
+func (r *bucketIndexReader) LabelNames() ([]string, error) {
 	return nil, errors.New("not implemented")
 }
 
